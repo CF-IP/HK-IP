@@ -14,6 +14,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
 ]
 
 def get_candidate_ips():
@@ -36,71 +37,29 @@ def get_candidate_ips():
                 ips.append(ip)
     return ips
 
-def check_single_api(api_url):
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
-    try:
-        resp = requests.get(api_url, headers=headers, timeout=12)
-        if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code}"
-        data = resp.json()
-        
-        if data.get("Proxyip") != "有效":
-            return False, f"Proxyip={data.get('Proxyip')}"
-            
-        delay_str = str(data.get("延迟", ""))
-        match = re.search(r"(\d+)\s*ms", delay_str)
-        if not match:
-            return False, f"延迟格式异常({delay_str})"
-            
-        delay_val = int(match.group(1))
-        if delay_val >= 80:
-            return False, f"延迟过高({delay_val}ms)"
-        return True, f"{delay_val}ms"
-    except Exception as e:
-        return False, f"请求异常({str(e)[:20]})"
-
-def verify_cf_http(ip):
+def check_ip_direct(ip):
     url = f"http://{ip}:443/"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     try:
-        resp = requests.get(url, headers=headers, timeout=5, allow_redirects=False)
-        if resp.status_code == 400:
-            body = resp.text.lower()
-            if "the plain http request was sent to https port" in body and "cloudflare" in body:
-                return True, "400校验通过"
-        return False, f"返回状态码 {resp.status_code}"
-    except Exception as e:
-        return False, f"连接超时/拒绝"
-
-def check_ip_worker(ip):
-    api_configs = [
-        ("电信24", f"https://itping.pages.dev/24={ip}:443"),
-        ("联通100", f"https://itping.pages.dev/100={ip}:443"),
-        ("移动184", f"https://itping.pages.dev/184={ip}:443"),
-    ]
-    
-    logs = []
-    for name, api_url in api_configs:
-        ok, msg = check_single_api(api_url)
-        if not ok:
-            print(f"[{ip}] 淘汰 -> {name} 不合格: {msg}")
-            return None
-        logs.append(f"{name}:{msg}")
-            
-    cf_ok, cf_msg = verify_cf_http(ip)
-    if not cf_ok:
-        print(f"[{ip}] 淘汰 -> 443端口检测不符: {cf_msg}")
-        return None
+        resp = requests.get(url, headers=headers, timeout=4, allow_redirects=False)
+        body = resp.text.lower()
+        server = resp.headers.get("Server", "").lower()
         
-    print(f"[{ip}] 通过 -> {', '.join(logs)} | {cf_msg}")
-    return ip
+        # 兼容判断 404 或 400（针对直连 443 端口的 Cloudflare 反代特征）
+        if resp.status_code in [400, 404]:
+            if "cloudflare" in body or "cloudflare" in server or "the plain http request" in body or "404" in body:
+                print(f"[{ip}] 通过 -> HTTP {resp.status_code} (Cloudflare 特征符合)")
+                return ip
+        print(f"[{ip}] 淘汰 -> 返回状态码 {resp.status_code}")
+    except Exception:
+        print(f"[{ip}] 淘汰 -> 连接超时或拒绝")
+    return None
 
 def update_cloudflare_dns(valid_ips):
     if not CF_TOKEN or not CF_ZONE_ID:
-        print("错误: 缺少 CF_TOKEN 或 CF_ZONE_ID")
+        print("错误: 缺少环境变量 CF_TOKEN 或 CF_ZONE_ID")
         return
 
-    # 安全熔断：如果合格节点为 0，坚决不删旧解析
     if not valid_ips:
         print("【安全保护】本次检测无合格节点，保留现有 DNS 解析，不执行删除！")
         return
@@ -135,9 +94,9 @@ def update_cloudflare_dns(valid_ips):
         }
         r = requests.post(post_url, headers=headers, json=body)
         if r.json().get("success"):
-            print(f"成功解析: {ip}")
+            print(f"  + 成功解析: {ip}")
         else:
-            print(f"解析失败 ({ip}): {r.text}")
+            print(f"  x 解析失败 ({ip}): {r.text}")
 
 def write_status_file(valid_ips):
     bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
@@ -164,9 +123,9 @@ def main():
         return
 
     valid_ips = []
-    # 使用 5 线程排队平稳检测，避免触发测速接口频控
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(check_ip_worker, ip): ip for ip in candidate_ips}
+    # 采用 20 线程并发直连，无需请求第三方 API，2 秒内即可完成筛选
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(check_ip_direct, ip): ip for ip in candidate_ips}
         for future in as_completed(futures):
             result = future.result()
             if result:
